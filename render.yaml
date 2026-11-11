@@ -2,21 +2,21 @@ services:
   - type: web
     name: advocate-priyanka-website
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm ci
     startCommand: npm start
     healthCheckPath: /healthz
-    domains:
-      - adv.priyankachoudhary.com
-    disk:
-      name: advocate-priyanka-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
-      - key: DATA_DIR
-        value: /var/data
+      - key: STORAGE_MODE
+        value: supabase
       - key: TRUST_PROXY
         value: "1"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: payment-receipts
       - key: ADMIN_USERNAME
         sync: false
       - key: ADMIN_PASSWORD

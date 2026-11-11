@@ -3,6 +3,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { createClient } = require('@supabase/supabase-js');
 const Database = require('better-sqlite3');
 const express = require('express');
 const { rateLimit } = require('express-rate-limit');
@@ -27,6 +28,7 @@ const SERVICE_NAMES = [
 ];
 const PAGE_SIZE = 25;
 const MAX_RECEIPT_BYTES = 5 * 1024 * 1024;
+const RECEIPT_FILENAME_PATTERN = /^[0-9a-f-]{36}\.(png|jpg|webp)$/;
 const RECEIPT_TYPES = {
   png: {
     mime: 'image/png',
@@ -74,6 +76,257 @@ function initializeDatabase(db) {
   if (!columns.has('receipt_mime')) {
     db.exec('ALTER TABLE enquiries ADD COLUMN receipt_mime TEXT');
   }
+}
+
+function validReceiptMetadata(filename, mime) {
+  if (typeof filename !== 'string' || !RECEIPT_FILENAME_PATTERN.test(filename)) {
+    return false;
+  }
+  const extension = filename.split('.').pop();
+  return RECEIPT_TYPES[extension]?.mime === mime;
+}
+
+function createSqliteStore(db, uploadDirectory) {
+  const privateUploadDirectory = path.resolve(
+    uploadDirectory || path.join(__dirname, 'data', 'uploads'),
+  );
+  fs.mkdirSync(privateUploadDirectory, { recursive: true, mode: 0o700 });
+  fs.chmodSync(privateUploadDirectory, 0o700);
+
+  return {
+    async createEnquiry(enquiry, receipt) {
+      const filename = receipt ? `${crypto.randomUUID()}.${receipt.extension}` : null;
+      const receiptPath = filename ? path.join(privateUploadDirectory, filename) : null;
+      try {
+        if (receiptPath) {
+          fs.writeFileSync(receiptPath, receipt.buffer, { flag: 'wx', mode: 0o600 });
+        }
+        const inserted = db.prepare(`
+          INSERT INTO enquiries (
+            name, phone, service, message, consent, payment_made, receipt_filename, receipt_mime
+          )
+          VALUES (
+            @name, @phone, @service, @message, 1, @paymentMade, @receiptFilename, @receiptMime
+          )
+        `).run({
+          ...enquiry,
+          paymentMade: enquiry.paymentMade ? 1 : 0,
+          receiptFilename: filename,
+          receiptMime: receipt?.mime || null,
+        });
+        return inserted.lastInsertRowid;
+      } catch (error) {
+        if (receiptPath) {
+          try {
+            fs.unlinkSync(receiptPath);
+          } catch (cleanupError) {
+            if (cleanupError.code !== 'ENOENT') {
+              console.error('Unable to remove an unassociated payment screenshot:', cleanupError);
+            }
+          }
+        }
+        throw error;
+      }
+    },
+
+    async listEnquiries(page, pageSize) {
+      const offset = (page - 1) * pageSize;
+      const total = db.prepare('SELECT COUNT(*) AS count FROM enquiries').get().count;
+      const rows = db.prepare(`
+        SELECT
+          id, name, phone, service, message, created_at AS createdAt,
+          payment_made AS paymentMade,
+          receipt_filename IS NOT NULL AS hasReceipt
+        FROM enquiries
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+      `).all(pageSize, offset);
+      return {
+        total,
+        items: rows.map((row) => ({
+          ...row,
+          paymentMade: Boolean(row.paymentMade),
+          hasReceipt: Boolean(row.hasReceipt),
+        })),
+      };
+    },
+
+    async getReceipt(id) {
+      const enquiry = db.prepare(`
+        SELECT receipt_filename AS filename, receipt_mime AS mime
+        FROM enquiries WHERE id = ?
+      `).get(id);
+      if (!enquiry || !validReceiptMetadata(enquiry.filename, enquiry.mime)) {
+        return null;
+      }
+      const receiptPath = path.join(privateUploadDirectory, enquiry.filename);
+      if (!fs.existsSync(receiptPath)) {
+        return null;
+      }
+      return {
+        body: fs.readFileSync(receiptPath),
+        mime: enquiry.mime,
+        extension: enquiry.filename.split('.').pop(),
+      };
+    },
+
+    async deleteEnquiry(id) {
+      const enquiry = db.prepare(`
+        SELECT receipt_filename AS filename, receipt_mime AS mime
+        FROM enquiries WHERE id = ?
+      `).get(id);
+      if (!enquiry) {
+        return false;
+      }
+      if (enquiry.filename) {
+        if (!validReceiptMetadata(enquiry.filename, enquiry.mime)) {
+          throw new Error('Unable to safely remove the payment screenshot.');
+        }
+        try {
+          fs.unlinkSync(path.join(privateUploadDirectory, enquiry.filename));
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+      }
+      return db.prepare('DELETE FROM enquiries WHERE id = ?').run(id).changes > 0;
+    },
+  };
+}
+
+function createSupabaseStore({
+  url = process.env.SUPABASE_URL,
+  serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY,
+  bucket = process.env.SUPABASE_STORAGE_BUCKET || 'payment-receipts',
+  client,
+} = {}) {
+  if (!client && (!url || !serviceRoleKey)) {
+    throw new Error('Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY for Supabase storage.');
+  }
+  if (!bucket) {
+    throw new Error('SUPABASE_STORAGE_BUCKET must not be empty.');
+  }
+  const supabase = client || createClient(url, serviceRoleKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+  const receipts = supabase.storage.from(bucket);
+
+  return {
+    async createEnquiry(enquiry, receipt) {
+      const filename = receipt ? `${crypto.randomUUID()}.${receipt.extension}` : null;
+      let uploaded = false;
+      try {
+        if (receipt) {
+          const { error } = await receipts.upload(filename, receipt.buffer, {
+            contentType: receipt.mime,
+            upsert: false,
+          });
+          if (error) throw error;
+          uploaded = true;
+        }
+        const { data, error } = await supabase
+          .from('enquiries')
+          .insert({
+            name: enquiry.name,
+            phone: enquiry.phone,
+            service: enquiry.service,
+            message: enquiry.message,
+            consent: true,
+            payment_made: enquiry.paymentMade,
+            receipt_filename: filename,
+            receipt_mime: receipt?.mime || null,
+          })
+          .select('id')
+          .single();
+        if (error) throw error;
+        return data.id;
+      } catch (error) {
+        if (uploaded) {
+          const { error: cleanupError } = await receipts.remove([filename]);
+          if (cleanupError) {
+            console.error('Unable to remove an unassociated payment screenshot:', cleanupError);
+          }
+        }
+        throw error;
+      }
+    },
+
+    async listEnquiries(page, pageSize) {
+      const offset = (page - 1) * pageSize;
+      const [{ count, error: countError }, { data, error }] = await Promise.all([
+        supabase.from('enquiries').select('id', { count: 'exact', head: true }),
+        supabase
+          .from('enquiries')
+          .select('id, name, phone, service, message, created_at, payment_made, receipt_filename')
+          .order('created_at', { ascending: false })
+          .order('id', { ascending: false })
+          .range(offset, offset + pageSize - 1),
+      ]);
+      if (countError) throw countError;
+      if (error) throw error;
+      return {
+        total: count || 0,
+        items: data.map((row) => ({
+          id: row.id,
+          name: row.name,
+          phone: row.phone,
+          service: row.service,
+          message: row.message,
+          createdAt: row.created_at,
+          paymentMade: Boolean(row.payment_made),
+          hasReceipt: Boolean(row.receipt_filename),
+        })),
+      };
+    },
+
+    async getReceipt(id) {
+      const { data: enquiry, error } = await supabase
+        .from('enquiries')
+        .select('receipt_filename, receipt_mime')
+        .eq('id', id)
+        .maybeSingle();
+      if (error) throw error;
+      if (!enquiry || !validReceiptMetadata(enquiry.receipt_filename, enquiry.receipt_mime)) {
+        return null;
+      }
+      const { data, error: downloadError } = await receipts.download(enquiry.receipt_filename);
+      if (downloadError) {
+        if (downloadError.statusCode === '404' || downloadError.status === 404) {
+          return null;
+        }
+        throw downloadError;
+      }
+      return {
+        body: Buffer.from(await data.arrayBuffer()),
+        mime: enquiry.receipt_mime,
+        extension: enquiry.receipt_filename.split('.').pop(),
+      };
+    },
+
+    async deleteEnquiry(id) {
+      const { data: enquiry, error: lookupError } = await supabase
+        .from('enquiries')
+        .select('receipt_filename, receipt_mime')
+        .eq('id', id)
+        .maybeSingle();
+      if (lookupError) throw lookupError;
+      if (!enquiry) return false;
+      if (enquiry.receipt_filename) {
+        if (!validReceiptMetadata(enquiry.receipt_filename, enquiry.receipt_mime)) {
+          throw new Error('Unable to safely remove the payment screenshot.');
+        }
+        const { error } = await receipts.remove([enquiry.receipt_filename]);
+        if (error) throw error;
+      }
+      const { data, error } = await supabase
+        .from('enquiries')
+        .delete()
+        .eq('id', id)
+        .select('id')
+        .maybeSingle();
+      if (error) throw error;
+      return Boolean(data);
+    },
+  };
 }
 
 function sameSecret(provided, expected) {
@@ -149,15 +402,13 @@ function validateEnquiry(body) {
 
 function createApp({
   db,
+  store: suppliedStore,
   adminUsername,
   adminPassword,
   trustProxy,
   uploadDirectory,
   enquiryLimit = 5,
 }) {
-  if (!db) {
-    throw new Error('A database connection is required.');
-  }
   if (
     !adminUsername ||
     adminUsername.includes(':') ||
@@ -166,11 +417,17 @@ function createApp({
   ) {
     throw new Error('Set ADMIN_USERNAME and an ADMIN_PASSWORD of at least 16 characters.');
   }
+  const store = suppliedStore || (db ? createSqliteStore(db, uploadDirectory) : null);
+  if (
+    !store ||
+    !['createEnquiry', 'listEnquiries', 'getReceipt', 'deleteEnquiry'].every(
+      (method) => typeof store[method] === 'function',
+    )
+  ) {
+    throw new Error('A valid enquiry storage provider is required.');
+  }
 
   const app = express();
-  const privateUploadDirectory = path.resolve(uploadDirectory || path.join(__dirname, 'data', 'uploads'));
-  fs.mkdirSync(privateUploadDirectory, { recursive: true, mode: 0o700 });
-  fs.chmodSync(privateUploadDirectory, 0o700);
   app.disable('x-powered-by');
   if (trustProxy) {
     app.set('trust proxy', trustProxy);
@@ -227,7 +484,7 @@ function createApp({
     res.sendFile(path.join(__dirname, SITE_FILE));
   });
 
-  app.post('/api/enquiries', enquiryLimiter, receiveReceipt, (req, res, next) => {
+  app.post('/api/enquiries', enquiryLimiter, receiveReceipt, async (req, res, next) => {
     const result = validateEnquiry(req.body);
     if (result.error) {
       return res.status(400).json({ error: result.error });
@@ -236,51 +493,22 @@ function createApp({
       return res.status(400).json({ error: 'A payment screenshot is required when payment has been made.' });
     }
 
-    let receiptType;
-    let receiptFilename = null;
-    let receiptPath;
+    let receipt;
     if (req.file) {
-      receiptType = Object.values(RECEIPT_TYPES).find((type) =>
+      const receiptType = Object.values(RECEIPT_TYPES).find((type) =>
         type.signature(req.file.buffer),
       );
       if (!receiptType) {
         return res.status(400).json({ error: 'Upload a valid PNG, JPEG, or WebP image.' });
       }
-
       const extension = Object.entries(RECEIPT_TYPES).find(([, type]) => type === receiptType)[0];
-      receiptFilename = `${crypto.randomUUID()}.${extension}`;
-      receiptPath = path.join(privateUploadDirectory, receiptFilename);
+      receipt = { buffer: req.file.buffer, mime: receiptType.mime, extension };
     }
 
     try {
-      if (req.file) {
-        fs.writeFileSync(receiptPath, req.file.buffer, { flag: 'wx', mode: 0o600 });
-      }
-      const insert = db.prepare(`
-        INSERT INTO enquiries (
-          name, phone, service, message, consent, payment_made, receipt_filename, receipt_mime
-        )
-        VALUES (
-          @name, @phone, @service, @message, 1, @paymentMade, @receiptFilename, @receiptMime
-        )
-      `);
-      const inserted = insert.run({
-        ...result.enquiry,
-        paymentMade: result.enquiry.paymentMade ? 1 : 0,
-        receiptFilename,
-        receiptMime: receiptType?.mime || null,
-      });
-      return res.status(201).json({ success: true, enquiryId: inserted.lastInsertRowid });
+      const enquiryId = await store.createEnquiry(result.enquiry, receipt);
+      return res.status(201).json({ success: true, enquiryId });
     } catch (error) {
-      if (receiptPath) {
-        try {
-          fs.unlinkSync(receiptPath);
-        } catch (cleanupError) {
-          if (cleanupError.code !== 'ENOENT') {
-            console.error('Unable to remove an unassociated payment screenshot:', cleanupError);
-          }
-        }
-      }
       return next(error);
     }
   });
@@ -296,7 +524,7 @@ function createApp({
 
   app.use('/api/admin', noStore, adminLimiter, requireAdmin);
 
-  app.get('/api/admin/enquiries', (req, res, next) => {
+  app.get('/api/admin/enquiries', async (req, res, next) => {
     const page = req.query.page === undefined ? 1 : Number(req.query.page);
     if (!Number.isSafeInteger(page) || page < 1) {
       return res.status(400).json({ error: 'Page must be a positive integer.' });
@@ -307,66 +535,34 @@ function createApp({
     }
 
     try {
-      const total = db.prepare('SELECT COUNT(*) AS count FROM enquiries').get().count;
-      const rows = db
-        .prepare(`
-          SELECT
-            id, name, phone, service, message, created_at AS createdAt,
-            payment_made AS paymentMade,
-            receipt_filename IS NOT NULL AS hasReceipt
-          FROM enquiries
-          ORDER BY created_at DESC, id DESC
-          LIMIT ? OFFSET ?
-        `)
-        .all(PAGE_SIZE, offset);
-      const items = rows.map((row) => ({
-        ...row,
-        paymentMade: Boolean(row.paymentMade),
-        hasReceipt: Boolean(row.hasReceipt),
-      }));
+      const { items, total } = await store.listEnquiries(page, PAGE_SIZE);
       return res.json({ items, page, pageSize: PAGE_SIZE, total });
     } catch (error) {
       return next(error);
     }
   });
 
-  app.get('/api/admin/enquiries/:id/receipt', (req, res, next) => {
+  app.get('/api/admin/enquiries/:id/receipt', async (req, res, next) => {
     const id = Number(req.params.id);
     if (!/^[1-9]\d*$/.test(req.params.id) || !Number.isSafeInteger(id)) {
       return res.status(400).json({ error: 'Invalid enquiry ID.' });
     }
 
     try {
-      const enquiry = db
-        .prepare('SELECT receipt_filename AS filename, receipt_mime AS mime FROM enquiries WHERE id = ?')
-        .get(id);
-      if (!enquiry || !enquiry.filename || !enquiry.mime) {
+      const receipt = await store.getReceipt(id);
+      if (!receipt) {
         return res.status(404).json({ error: 'Payment screenshot not found.' });
       }
-      if (!/^[0-9a-f-]{36}\.(png|jpg|webp)$/.test(enquiry.filename)) {
-        return res.status(404).json({ error: 'Payment screenshot not found.' });
-      }
-      const expectedMime = RECEIPT_TYPES[enquiry.filename.split('.').pop()]?.mime;
-      if (enquiry.mime !== expectedMime) {
-        return res.status(404).json({ error: 'Payment screenshot not found.' });
-      }
-      const receiptPath = path.join(privateUploadDirectory, enquiry.filename);
-      if (!fs.existsSync(receiptPath)) {
-        return res.status(404).json({ error: 'Payment screenshot not found.' });
-      }
-      res.set('Content-Type', enquiry.mime);
-      const extension = enquiry.filename.split('.').pop();
-      res.set('Content-Disposition', `inline; filename="payment-screenshot.${extension}"`);
+      res.set('Content-Type', receipt.mime);
+      res.set('Content-Disposition', `inline; filename="payment-screenshot.${receipt.extension}"`);
       res.set('X-Content-Type-Options', 'nosniff');
-      return res.sendFile(receiptPath, (error) => {
-        if (error && !res.headersSent) next(error);
-      });
+      return res.send(receipt.body);
     } catch (error) {
       return next(error);
     }
   });
 
-  app.delete('/api/admin/enquiries/:id', (req, res, next) => {
+  app.delete('/api/admin/enquiries/:id', async (req, res, next) => {
     if (!/^[1-9]\d*$/.test(req.params.id)) {
       return res.status(400).json({ error: 'Invalid enquiry ID.' });
     }
@@ -376,24 +572,8 @@ function createApp({
     }
 
     try {
-      const enquiry = db
-        .prepare('SELECT receipt_filename AS filename FROM enquiries WHERE id = ?')
-        .get(id);
-      if (!enquiry) {
-        return res.status(404).json({ error: 'Enquiry not found.' });
-      }
-      if (enquiry.filename) {
-        if (!/^[0-9a-f-]{36}\.(png|jpg|webp)$/.test(enquiry.filename)) {
-          return res.status(500).json({ error: 'Unable to safely remove the payment screenshot.' });
-        }
-        try {
-          fs.unlinkSync(path.join(privateUploadDirectory, enquiry.filename));
-        } catch (error) {
-          if (error.code !== 'ENOENT') throw error;
-        }
-      }
-      const result = db.prepare('DELETE FROM enquiries WHERE id = ?').run(id);
-      if (result.changes === 0) return res.status(404).json({ error: 'Enquiry not found.' });
+      const deleted = await store.deleteEnquiry(id);
+      if (!deleted) return res.status(404).json({ error: 'Enquiry not found.' });
       return res.status(204).end();
     } catch (error) {
       return next(error);
@@ -442,22 +622,29 @@ function startServer() {
     throw new Error('Set ADMIN_USERNAME and an ADMIN_PASSWORD of at least 16 characters.');
   }
 
-  const dataDirectory = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
-  fs.mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
-  fs.chmodSync(dataDirectory, 0o700);
-  const databasePath = path.join(dataDirectory, 'enquiries.sqlite3');
-  const db = new Database(databasePath);
-  initializeDatabase(db);
-  fs.chmodSync(databasePath, 0o600);
-  const uploadDirectory = path.join(dataDirectory, 'uploads');
-  fs.mkdirSync(uploadDirectory, { recursive: true, mode: 0o700 });
+  let db;
+  let store;
+  const storageMode = process.env.STORAGE_MODE || 'sqlite';
+  if (storageMode === 'supabase') {
+    store = createSupabaseStore();
+  } else if (storageMode === 'sqlite') {
+    const dataDirectory = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+    fs.mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dataDirectory, 0o700);
+    const databasePath = path.join(dataDirectory, 'enquiries.sqlite3');
+    db = new Database(databasePath);
+    initializeDatabase(db);
+    fs.chmodSync(databasePath, 0o600);
+    store = createSqliteStore(db, path.join(dataDirectory, 'uploads'));
+  } else {
+    throw new Error('STORAGE_MODE must be either sqlite or supabase.');
+  }
 
   const app = createApp({
-    db,
+    store,
     adminUsername,
     adminPassword,
     trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
-    uploadDirectory,
   });
   const port = Number(process.env.PORT || 3000);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -470,7 +657,7 @@ function startServer() {
 
   function shutdown() {
     server.close((error) => {
-      db.close();
+      db?.close();
       if (error) {
         console.error('Server shutdown failed:', error);
         process.exitCode = 1;
@@ -491,4 +678,11 @@ if (require.main === module) {
   }
 }
 
-module.exports = { createApp, initializeDatabase, parseTrustProxy, validateEnquiry };
+module.exports = {
+  createApp,
+  createSqliteStore,
+  createSupabaseStore,
+  initializeDatabase,
+  parseTrustProxy,
+  validateEnquiry,
+};
