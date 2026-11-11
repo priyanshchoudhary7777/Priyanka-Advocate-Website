@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: advocate-priyanka-website
+    runtime: node
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz
+    domains:
+      - adv.priyankachoudhary.com
+    disk:
+      name: advocate-priyanka-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: TRUST_PROXY
+        value: "1"
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
