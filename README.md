@@ -1,6 +1,8 @@
 # Advocate Priyanka Choudhary website
 
-The site is served by a Node.js application. Enquiries are validated by the server and saved either in local SQLite (for development) or Supabase Postgres (for deployment). Payment screenshots are required only when a visitor marks payment as made; Supabase stores them in a private bucket. The password-protected inbox is available at `/admin`.
+The website can be published free as a static GitHub Pages site using `index.html`. The static version opens a prefilled WhatsApp message; it does not save enquiries, provide an admin inbox, or upload payment screenshots. Visitors must press Send in WhatsApp and attach a payment screenshot there if they have paid.
+
+The optional Node.js backend validates and stores enquiries. It uses local SQLite for development or Supabase Postgres and a private Supabase Storage bucket for a hosted deployment. The password-protected inbox is available at `/admin` when the backend is deployed.
 
 ## Run locally
 
@@ -18,18 +20,25 @@ Enter a unique password of at least 16 characters when prompted. Open `http://lo
 
 For a custom local database location, set `DATA_DIR` to a writable directory. Set `PORT` and `HOST` as needed by your environment. If the app is behind a reverse proxy, configure `TRUST_PROXY` to the exact proxy hop count or trusted proxy addresses; do not set it to `true` without understanding the network topology. Local SQLite is not suitable for a host with an ephemeral filesystem.
 
-## Free-tier deployment with Render and Supabase
+## Publish the free static site with GitHub Pages
 
-The included `render.yaml` configures a free Render web service and secure prompts for application credentials. Enquiry records and private screenshots are stored in Supabase so they survive Render restarts; the Render service itself has no persistent disk and may sleep when idle.
+The repository includes a static `index.html`, so GitHub Pages can serve it without a server or payment method.
 
-1. Create a Supabase project on its free tier.
-2. In the Supabase SQL Editor, run [`supabase/schema.sql`](./supabase/schema.sql). This creates the enquiries table with row-level security enabled and a private receipt bucket.
-3. In Render, create a Blueprint from the public GitHub repository and use the included `render.yaml`.
-4. Enter the Supabase project URL, Supabase `service_role` key, a private admin username, and a unique admin password of at least 16 characters into Render's secret prompts. Never put these values in GitHub or send them in chat.
-5. After Render deploys, use its `onrender.com` URL first and verify the site, enquiry form, `/admin`, and private receipt viewing.
-6. Configure `adv.priyankachoudhary.com` later only if desired. Add DNS records only after reviewing the targets shown in Render.
+1. Open the repository's **Settings → Pages**.
+2. Under **Build and deployment**, choose **Deploy from a branch**.
+3. Select branch `main`, folder `/ (root)`, and save.
+4. Wait for the Pages deployment to finish. The site URL is `https://priyanshchoudhary7777.github.io/Priyanka-Advocate-Website/`.
 
-Free services have provider quotas and availability limits; Render may sleep while idle and Supabase may enforce free-tier limits or pause inactive projects. Review provider usage and terms regularly. The site is not live until the Blueprint deploy succeeds.
+This static option does not run the Node backend. Do not enter sensitive information into the static form; it prepares a message in WhatsApp for the visitor to review and send.
+
+## Optional backend deployment
+
+The included `render.yaml` configures a free Render web service with Supabase-backed enquiries and private receipts. Free services have quotas and availability limits; the service may sleep while idle, and providers may require verification or payment details.
+
+1. Create a Supabase project and run [`supabase/schema.sql`](./supabase/schema.sql) in its SQL Editor.
+2. In Render, create a Blueprint from this repository and use `render.yaml`.
+3. Enter the Supabase project URL, service-role key, an admin username, and a unique password of at least 16 characters in Render's secret prompts. Never commit or share the service-role key.
+4. Verify the Render service URL, enquiry form, `/admin`, and private receipt viewing before using the backend.
 
 ## Hosting and security
 
